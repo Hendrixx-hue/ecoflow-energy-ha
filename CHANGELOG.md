@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.16.0] - 2026-07-31
+
+### Added
+- PowerOcean: optional Heating Rod Power sensor for systems with a PowerGlow accessory. The heating rod reports its power through the PowerOcean itself rather than as a device of its own, so no separate setup is needed. The sensor is read-only and disabled by default, because most PowerOcean systems have no heating rod attached. Enable it under Settings, Devices, PowerOcean, Entities. Contributed by @Xygen. (Ref #7)
+
 ## [1.15.0] - 2026-07-31
 
 ### Added
