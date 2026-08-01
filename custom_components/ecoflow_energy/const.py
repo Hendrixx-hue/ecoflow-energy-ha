@@ -83,10 +83,38 @@ HARD_UNAVAILABLE_S = 600.0  # 10 min: entities go unavailable
 SMARTPLUG_HARD_UNAVAILABLE_S = 600.0  # 10 min: SmartPlug hard cutoff
 HTTP_FALLBACK_INTERVAL_S = 30
 
-# Raw protobuf frame capture for diagnostics (app-auth push path).
-# Enough frames to cover several push cycles of every command a device sends,
-# truncated so a single oversized frame cannot bloat a diagnostics download.
-RAW_FRAME_LOG_MAX = 24
+# Raw protobuf frame capture for diagnostics (app-auth push path), bucketed
+# by message type. A shared ring holds whatever arrives most often: a
+# PowerOcean pushes its live telemetry every few seconds while a command such
+# as the EMS report arrives minutes apart, so 24 shared slots are the last
+# minute of the frequent one and the rare command is never in a download.
+#
+# The key budget is derived from what one device actually produces, not
+# picked for size, and the number comes from a measurement rather than from
+# the command table: a ten minute listen-only recording of a PowerOcean
+# (HJ31, 2026-08-01) delivered 60 frames in twelve distinct message types on
+# `property` alone - cmd_func 96 with ids 1, 3, 7, 8, 13, 33 and 34, plus
+# 53.14, 241.5, 241.36, 209.51 and 224.38. The decoded command list would
+# have suggested seven. The `get_reply` topic class adds those types a
+# second time, an unmapped command becomes a key of its own, and so does an
+# attached accessory's report.
+#
+# Buckets are claimed in arrival order and never evicted, so a budget that
+# merely matches the observed count is spent by the frequent pushes within
+# seconds, and the rare reports - the ones this bucketing exists to keep -
+# are dropped at the key gate minutes later, which is the failure the shared
+# ring had in a different place. Twenty is the measured twelve plus room for
+# the second topic class and for what a ten minute window did not show.
+#
+# Tightened against the unsupported-device probe below on the per-key axis
+# instead, because that is the axis that costs bytes without costing
+# coverage: three frames still hold the first, one middle and the newest
+# frame of every type. This buffer is not opt-in and not time-limited - it
+# runs on every device in Enhanced Mode for as long as the integration is
+# loaded. Worst case 20 * 3 * 512 B = 30 720 B (30 KiB) of frame payload per
+# device, roughly double that as hex text in the diagnostics download.
+RAW_FRAME_LOG_KEYS_MAX = 20
+RAW_FRAME_LOG_PER_KEY_MAX = 3
 RAW_FRAME_MAX_BYTES = 512
 
 # Unsupported-device probe: budget per message type instead of one shared ring.
