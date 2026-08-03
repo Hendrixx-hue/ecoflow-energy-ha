@@ -29,6 +29,7 @@ from custom_components.ecoflow_energy.diagnostics import (
     async_get_config_entry_diagnostics,
 )
 from custom_components.ecoflow_energy.coordinator import EcoFlowDeviceCoordinator
+from custom_components.ecoflow_energy.ecoflow.frame_capture import build_frame_entry
 
 from .conftest import (
     MOCK_DELTA_DEVICE,
@@ -1085,3 +1086,125 @@ class TestUnknownProtoFieldDiagnostics:
         coordinator._record_unknown_fields({"_unknown_fields": "nonsense"})
         coordinator._record_unknown_fields({})
         assert coordinator.unknown_proto_fields == {}
+
+
+class TestEventLogSerialLeak:
+    """The third serial leak of the 1.16.0 cycle, and the pass that ends the class.
+
+    The set_reply topic is /open/<cert_account>/<sn>/set_reply, so every
+    device write used to put a full serial and the account identifier into
+    the event log - a section of a diagnostics download that users are asked
+    to attach to public issues, and one that no redaction pass touched.
+    """
+
+    async def test_set_reply_event_records_no_topic_identifiers(
+        self,
+        hass: HomeAssistant,
+        standard_config_entry: MockConfigEntry,
+    ) -> None:
+        """The point fix: the serial never enters the log in the first place."""
+        standard_config_entry.add_to_hass(hass)
+        coordinator = EcoFlowDeviceCoordinator(
+            hass, standard_config_entry, MOCK_DELTA_DEVICE
+        )
+        sn = MOCK_DELTA_DEVICE["sn"]
+
+        coordinator._on_mqtt_message(f"/open/9876543210123456/{sn}/set_reply", b"{}")
+
+        assert coordinator.event_log, "the acknowledgement must still be recorded"
+        detail = coordinator.event_log[-1]["detail"]
+        assert sn not in detail
+        assert "9876543210123456" not in detail
+
+    async def test_diagnostics_redact_an_event_log_serial(
+        self,
+        hass: HomeAssistant,
+        standard_config_entry: MockConfigEntry,
+        mock_iot_api,
+        mock_mqtt_client,
+        mock_http_client,
+    ) -> None:
+        """The structural fix: a serial planted anywhere is caught on the way out.
+
+        Written against the section rather than the caller on purpose. The
+        point fix above closes the one path that is known today; this one has
+        to keep holding for a path somebody adds next year without thinking
+        about redaction at all.
+        """
+        standard_config_entry.add_to_hass(hass)
+        with patch(
+            "custom_components.ecoflow_energy.coordinator.EcoFlowDeviceCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ):
+            await hass.config_entries.async_setup(standard_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        coordinators = hass.data[DOMAIN][standard_config_entry.entry_id]
+        coordinator = next(iter(coordinators.values()))
+        sn = MOCK_DELTA_DEVICE["sn"]
+        coordinator._log_event("set_reply", f"topic=/open/acct/{sn}/set_reply")
+
+        result = await async_get_config_entry_diagnostics(hass, standard_config_entry)
+
+        assert sn not in json.dumps(result)
+
+
+class TestRedactionDoesNotEatTheEvidence:
+    """The redaction pass must not destroy what diagnostics exist for.
+
+    Running the whole payload through serial redaction looked safe: hex dumps
+    are lowercase and the pattern wants uppercase. But hex digits 0-9 are
+    inside [A-Z0-9], so any run of fifteen or more hex characters carrying no
+    a-f matches it. Against this repo's own fixtures that corrupted 25 of 25
+    captured frames - the artefact every device added this year was built
+    from, quietly replaced by REDACTED.
+    """
+
+    def test_a_captured_frame_survives_the_pass(self) -> None:
+        # Long enough to contain digit-only runs, which is what triggered it.
+        frame_hex = "0a370a12c7768a219733bf641062af33b754414113301002182020012801"
+        payload = {"raw_frames": {"frames": [{"hex": frame_hex, "topic": "property"}]}}
+
+        result = _redact_serials(payload)
+
+        assert result["raw_frames"]["frames"][0]["hex"] == frame_hex
+
+    def test_a_frame_carrying_a_masked_serial_stays_decodable(self) -> None:
+        """The guaranteed case, not the statistical one.
+
+        sanitize_frame masks a serial with a run of 0x58 bytes, which is "58"
+        per byte in hex: a 16 character serial becomes 32 consecutive digits
+        and matches the pattern every single time. Nearly every PowerOcean
+        frame carries the serial, so this was not an edge case for them. What
+        came out was not even valid hex, and the byte offsets that
+        sanitize_frame deliberately preserves were gone with it.
+        """
+        sn = "HJ31TEST00000001"
+        payload = b"\x0a\x30\x12\x10" + sn.encode() + b"\x1a\x08\x08\x01\x10\x02"
+        entry = build_frame_entry(
+            "/app/device/property/x", payload, [sn], 512, parsed_keys=3
+        )
+        original = entry["hex"]
+
+        result = _redact_serials({"raw_frames": {"frames": [entry]}})
+        kept = result["raw_frames"]["frames"][0]["hex"]
+
+        assert kept == original
+        assert len(kept) == len(original)
+        bytes.fromhex(kept)  # raises if the pass broke the encoding
+        # The serial is gone because capture masked it, not because of this pass.
+        assert sn not in json.dumps(result)
+
+    def test_a_serial_beside_a_frame_is_still_redacted(self) -> None:
+        """The exemption is for the frame value, not for its neighbours."""
+        payload = {
+            "raw_frames": {
+                "frames": [
+                    {"hex": "0a370a12c7768a2197331002182020012801", "sn": "HJ31TEST00000001"}
+                ]
+            }
+        }
+
+        result = _redact_serials(payload)
+
+        assert "HJ31TEST00000001" not in json.dumps(result)

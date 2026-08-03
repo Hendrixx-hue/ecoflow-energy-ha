@@ -49,6 +49,29 @@ class TestDeltaProfileRouting:
 
 
 class TestDeviceTypeRouting:
+    def test_powerstream_is_not_a_stream(self) -> None:
+        """"PowerStream" contains "stream", and the match is by substring.
+
+        A PowerStream microinverter was classified as a Stream battery and
+        given its whole entity set. It connected, reported nothing this
+        parser understands and settled on stale, so the owner saw a full
+        device with 54 readings that could never fill (#188). Unsupported is
+        the honest answer and the one that leads somewhere: it asks for a
+        capture instead of pretending.
+        """
+        assert get_device_type("PowerStream", "HW51TEST00000001") == "unknown"
+        assert get_device_type("Power Stream", "HW51TEST00000001") == "unknown"
+
+    def test_the_real_stream_family_still_routes(self) -> None:
+        """The guard above must not cost the devices it sits in front of.
+
+        A guard, not a regression detector: it passes on the code before the
+        PowerStream fix too. It is here so that a future addition to the
+        not-this-family list cannot quietly swallow a real Stream.
+        """
+        for name in ("Stream AC Pro", "Stream Micro", "Stream Ultra", "STREAM AC"):
+            assert get_device_type(name, "") == "stream", name
+
     def test_stream_detected_by_bk31_prefix(self) -> None:
         assert get_device_type("", "BK31_TEST_DEVICE") == "stream"
 
@@ -591,3 +614,103 @@ class TestBinarySensors:
         keys = _extract_sensor_keys("DELTA2MAX_BINARY_SENSORS")
         assert len(keys) >= 4
         assert "ac_enabled" in keys
+
+
+# ---------------------------------------------------------------------------
+# Mode reach
+# ---------------------------------------------------------------------------
+
+# Key families the Standard-Mode parsers build with an f-string, so a literal
+# search of the source cannot find them. Verified against powerocean.py:
+# pack{n}_ (line 122, 504), mppt_pv{n}_ (230), grid_phase_{a,b,c}_ (246, 253).
+_DYNAMIC_KEY_FAMILIES = ("pack", "mppt_pv", "grid_phase_")
+
+# Sources for the two device families whose Enhanced-only reach was wrong in
+# the 1.16.0 betas. Each entry is (definition list, Standard-Mode parser).
+_STANDARD_MODE_SOURCES = (
+    ("DELTA3_SENSORS", DELTA3_SENSORS, "delta3_http.py"),
+    ("POWEROCEAN_SENSORS", POWEROCEAN_SENSORS, "powerocean.py"),
+    ("POWEROCEAN_BINARY_SENSORS", POWEROCEAN_BINARY_SENSORS, "powerocean.py"),
+)
+
+_PARSER_DIR = (
+    Path(__file__).parent.parent
+    / "custom_components"
+    / "ecoflow_energy"
+    / "ecoflow"
+    / "parsers"
+)
+
+
+def _integrator_derived_keys() -> set[str]:
+    """Energy keys the Riemann integrator produces, not any parser."""
+    import ecoflow_energy.const as const_module
+
+    derived: set[str] = set()
+    for name in dir(const_module):
+        if name.endswith("_POWER_TO_ENERGY"):
+            derived |= set(getattr(const_module, name).values())
+    return derived
+
+
+class TestModeReach:
+    """Every entity offered in Standard Mode must have a Standard-Mode source.
+
+    The heating rod shipped reading from a quota that account sign-in never
+    polls, and the fix for it left the mirror image in place: 37 definitions
+    whose only source is the protobuf push path were offered with developer
+    keys, 8 of them enabled by default. Both are the same mistake - an entity
+    created against a path that does not run for that user. Nothing failed,
+    because a permanently empty sensor looks exactly like a device that has
+    not reported yet.
+
+    A definition that this test cannot trace to a Standard-Mode parser is
+    either Enhanced-only and needs the flag, or it is reachable in a way the
+    test does not know about and belongs in one of the two lists above. Both
+    outcomes are a decision someone has to make on purpose.
+    """
+
+    def test_every_standard_mode_key_has_a_standard_mode_source(self) -> None:
+        derived = _integrator_derived_keys()
+        unreachable: list[str] = []
+
+        for list_name, defs, parser_file in _STANDARD_MODE_SOURCES:
+            source = (_PARSER_DIR / parser_file).read_text()
+            for defn in defs:
+                if getattr(defn, "enhanced_only", False):
+                    continue
+                if getattr(defn, "accessory", False):
+                    continue
+                if defn.key in derived:
+                    continue
+                if defn.key.startswith(_DYNAMIC_KEY_FAMILIES):
+                    continue
+                if defn.key not in source:
+                    unreachable.append(f"{list_name}.{defn.key} ({parser_file})")
+
+        assert not unreachable, (
+            "these entities are created in Standard Mode but nothing there can "
+            "fill them:\n  " + "\n  ".join(unreachable)
+        )
+
+    def test_the_flag_is_not_applied_where_a_source_exists(self) -> None:
+        """The opposite error: hiding an entity that Standard Mode could fill.
+
+        A guard, not a regression detector: it passes before this change as
+        well, because the error it looks for was never made. It earns its
+        place by making the next batch of flags cheap to trust.
+        """
+        wrongly_hidden: list[str] = []
+
+        for list_name, defs, parser_file in _STANDARD_MODE_SOURCES:
+            source = (_PARSER_DIR / parser_file).read_text()
+            for defn in defs:
+                if not getattr(defn, "enhanced_only", False):
+                    continue
+                if defn.key in source:
+                    wrongly_hidden.append(f"{list_name}.{defn.key} ({parser_file})")
+
+        assert not wrongly_hidden, (
+            "marked Enhanced-only although the Standard-Mode parser names them:\n  "
+            + "\n  ".join(wrongly_hidden)
+        )

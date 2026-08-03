@@ -211,6 +211,24 @@ class EcoFlowDeviceCoordinator(
         # recent (backup, solar) pair.
         self._powerocean_soc_pending: tuple[int, int] | None = None
         self._powerocean_soc_debounce_unsub: asyncio.TimerHandle | None = None
+        # The two slider values as the device last had them, captured when a
+        # debounce window opens - before the entities write their optimistic
+        # value, which is the only moment the device value is still readable.
+        self._powerocean_soc_before: dict[str, Any] = {}
+        # Counts debounce windows. A flush that failed may only roll back if
+        # no newer window has opened since, otherwise a slow failing write
+        # would undo a faster successful one.
+        self._powerocean_soc_generation: int = 0
+        # True from the moment a write cycle starts until it is resolved by a
+        # success or a rollback. Taking a fresh snapshot needs this rather
+        # than "no pending value": the flush clears the pending value when it
+        # begins, not when its write comes back, so a second drag during a
+        # five second publish timeout would otherwise snapshot the optimistic
+        # values of the write that is still failing.
+        self._powerocean_soc_cycle_open: bool = False
+        # Set when a rollback lands, so the two sliders drop their optimistic
+        # lock instead of sitting on a value the device refused for 5 s.
+        self._powerocean_soc_rollback_generation: int = 0
         self._credential_obtained_ts: float = 0.0
         self._credential_refresh_unsub: asyncio.TimerHandle | None = None
         self._event_log: deque[dict[str, Any]] = deque(maxlen=50)
