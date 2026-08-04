@@ -112,6 +112,70 @@ _AC_CHARGE_MODES: dict[int, str] = {
     2: "silence",
 }
 
+# Port priority, also push-only. `power_outage_port_type` -> sensor key stem.
+# The names come from the app's own port list, which hard-codes type 2 as the
+# first AC outlet and type 3 as the second.
+PORT_PRIORITY_TYPES: dict[int, str] = {
+    1: "dc",
+    2: "ac1",
+    3: "ac2",
+}
+_PORT_PRIORITY_ACTIVE_KEY = "port_priority_active"
+
+# The device reports port priority as being in effect with exactly this value;
+# every other value means it is not. Observed in both directions on a D3M1 on
+# 2026-08-04 by cutting mains ahead of the unit: the flag went to 1 in the same
+# frame that reported the AC input at 0 W, and back to 2 when mains returned.
+# The state of charge never came near any port's cutoff during that run, which
+# settles what "active" means - the feature engages when there is no AC input,
+# not when a port is actually dropped.
+_PORT_PRIORITY_ACTIVE_VALUE = 1
+
+
+def port_priority_keys(stem: str) -> tuple[str, str]:
+    """Return the (limited, cutoff) sensor keys for one port stem."""
+    return f"port_priority_{stem}_limited", f"port_priority_{stem}_cutoff_soc"
+
+
+def _port_priority_values(fields: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the port priority list into per-port keys.
+
+    The read-back carries all three ports on every push, so each item is
+    written out in full. `power_outage_port_enable` is proto3-default false
+    and therefore absent whenever a port is essential, which is the common
+    case - reading it with a default rather than a presence check is what
+    keeps an essential port from holding a stale True.
+    """
+    result: dict[str, Any] = {}
+
+    flag = fields.get("power_outages_active_flag")
+    if isinstance(flag, int) and not isinstance(flag, bool):
+        result[_PORT_PRIORITY_ACTIVE_KEY] = flag == _PORT_PRIORITY_ACTIVE_VALUE
+
+    nested = fields.get("power_outages_list")
+    if not isinstance(nested, dict):
+        return result
+
+    items = nested.get("power_outage_item")
+    if not isinstance(items, list):
+        return result
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        port_type = item.get("power_outage_port_type")
+        stem = PORT_PRIORITY_TYPES.get(port_type) if isinstance(port_type, int) else None
+        if stem is None:
+            # Type 0 is the enum's null member. The app skips those items too.
+            continue
+        limited_key, cutoff_key = port_priority_keys(stem)
+        result[limited_key] = bool(item.get("power_outage_port_enable", False))
+        cutoff = item.get("power_outage_min_soc")
+        if isinstance(cutoff, int) and not isinstance(cutoff, bool):
+            result[cutoff_key] = cutoff
+
+    return result
+
 
 def _translate_display_property(fields: dict[str, Any]) -> dict[str, Any]:
     """Map decoded status-frame fields onto their HTTP quota spelling."""
@@ -181,6 +245,8 @@ def _push_only_values(fields: dict[str, Any]) -> dict[str, Any]:
         label = _AC_CHARGE_MODES.get(mode)
         if label is not None:
             result[_AC_CHARGE_MODE_KEY] = label
+
+    result.update(_port_priority_values(fields))
     return result
 
 
