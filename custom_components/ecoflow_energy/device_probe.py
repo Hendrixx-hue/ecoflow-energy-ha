@@ -31,11 +31,19 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from datetime import timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
 
-from .const import RAW_FRAME_KEYS_MAX, RAW_FRAME_MAX_BYTES, RAW_FRAME_PER_KEY_MAX
+from .const import (
+    PROBE_WATCHDOG_INTERVAL_S,
+    RAW_FRAME_KEYS_MAX,
+    RAW_FRAME_MAX_BYTES,
+    RAW_FRAME_PER_KEY_MAX,
+)
 from .ecoflow.cloud_mqtt import EcoFlowMQTTClient
 from .ecoflow.frame_capture import (
     TypedFrameBuffer,
@@ -51,16 +59,25 @@ _LOGGER = logging.getLogger(__name__)
 class UnroutedDeviceProbe:
     """Listen-only frame capture for one unsupported device.
 
-    Deliberately minimal: no keep-alive timers, no re-subscribe logic, no
-    SET path. A diagnostics helper must never become a second,
-    half-maintained coordinator.
+    Deliberately minimal: no re-subscribe logic, no SET path. A diagnostics
+    helper must never become a second, half-maintained coordinator.
 
     The connection is opened with ``listen_only=True``, which is what
     actually holds the no-write promise: the shared client fires get-all
-    and latestQuotas at the device on every connect otherwise. Note that
-    paho reconnects on its own after a drop, so the probe is quiet in the
-    sense that it adds no logic of its own, not in the sense that the
-    socket stays down.
+    and latestQuotas at the device on every connect otherwise.
+
+    It does need one thing a purely passive helper would not: its own
+    reconnect. Paho retries after a drop on its own, but it retries with
+    the client id it was created with, and this broker rejects a client id
+    that has already been used. Only ``force_reconnect`` builds a fresh
+    one, and the coordinator is what normally drives it - a skipped device
+    has no coordinator. Without the watchdog the first disconnect in a
+    24 hour window is final, which is how a capture that ran all day
+    arrives holding nothing.
+
+    Every outcome is recorded rather than only logged at debug: the whole
+    point of the capture is to be read by someone who does not have the
+    hardware, and "it did not connect" is not an answer they can act on.
     """
 
     def __init__(
@@ -86,6 +103,26 @@ class UnroutedDeviceProbe:
         # detail of the GIL, not a property of the code - it does not hold on
         # a free-threaded build. Cheap enough to not depend on.
         self._capture_lock = threading.Lock()
+        # Set once the probe is told to stop, checked on every reconnect
+        # path. Without it the watchdog can resurrect a probe mid-unload:
+        # the timer's cancel runs in the entry's on_unload callbacks, which
+        # Home Assistant processes only after async_unload_entry returns,
+        # and async_unload_entry awaits in between - a tick landing in one
+        # of those awaits would find the session down (it was just
+        # disconnected) and rebuild it, leaving a live connection and a
+        # paho thread that nothing ever tears down.
+        self._stopped = False
+        # Connection history. Written from the paho thread via the status
+        # callback, read on the event loop when diagnostics are downloaded,
+        # so it shares the capture lock rather than relying on the GIL.
+        self._started_at = time.time()
+        self._connect_calls = 0
+        self._connects = 0
+        self._disconnects = 0
+        self._last_rc: int | None = None
+        self._last_reason = ""
+        self._last_connect_at: float | None = None
+        self._last_disconnect_at: float | None = None
         self._client = EcoFlowMQTTClient(
             certificate_account=cert_account,
             certificate_password=cert_password,
@@ -99,6 +136,7 @@ class UnroutedDeviceProbe:
             # while _on_connect still fires get-all and latestQuotas at the
             # device on every connect.
             listen_only=True,
+            status_handler=self._on_status,
         )
 
     @property
@@ -130,9 +168,147 @@ class UnroutedDeviceProbe:
             return sorted(self._topics)
 
     @property
-    def connected(self) -> bool:
-        """Return whether the listen-only session is up."""
-        return self._client.is_connected()
+    def connection(self) -> dict[str, Any]:
+        """Return what happened to the connection, in plain terms.
+
+        A capture that comes back empty has several causes that look
+        identical from the frame list: the broker refused the login, the
+        link went down hours ago and never came back, or the device simply
+        had nothing to say. The reader of a diagnostics download has no
+        access to the machine it was made on, so anything not recorded
+        here is lost.
+        """
+        now = time.time()
+        with self._capture_lock:
+            established = self._connects
+            last_rc = self._last_rc
+            last_reason = self._last_reason
+            last_connect_at = self._last_connect_at
+            last_disconnect_at = self._last_disconnect_at
+            out: dict[str, Any] = {
+                "connected": self._client.is_connected(),
+                "ever_connected": established > 0,
+                "connect_attempts": self._connect_calls,
+                "sessions": established,
+                "disconnects": self._disconnects,
+                "capture_age_s": round(now - self._started_at),
+            }
+
+        if last_rc is not None:
+            out["last_rc"] = last_rc
+            out["last_rc_reason"] = last_reason
+        if last_connect_at is not None:
+            out["last_connect_age_s"] = round(now - last_connect_at)
+        if last_disconnect_at is not None:
+            out["last_disconnect_age_s"] = round(now - last_disconnect_at)
+        out["verdict"] = self._verdict(out)
+        return out
+
+    @staticmethod
+    def _verdict(state: dict[str, Any]) -> str:
+        """Summarise the connection state in one sentence.
+
+        Written for the person reading an attached diagnostics file, who
+        should not have to infer the story from six counters.
+        """
+        if state["connected"]:
+            return "listening"
+        if not state["ever_connected"]:
+            rc = state.get("last_rc")
+            if rc:
+                return (
+                    f"never connected - the broker refused the session "
+                    f"(rc={rc}, {state.get('last_rc_reason', 'unknown')})"
+                )
+            return "never connected - no reply from the broker"
+        return (
+            "connected earlier and is down now - the frames below are what "
+            "arrived while it was up"
+        )
+
+    def _on_status(self, status: str, rc: int, message: str) -> None:
+        """Record a connection event (paho thread).
+
+        The client's message is stored as-is: it words each event in the
+        vocabulary that fits it (CONNACK reasons for a refused connect,
+        "Disconnected (rc=N)" for a drop). Re-deriving the words here from
+        the CONNACK table would caption disconnects with connect-refusal
+        language - disconnect reason codes are a different namespace, and
+        under paho 2.x a routine drop arrives as 128 or 141, which that
+        table cannot name. The messages contain no device or account
+        identifiers, which is what makes storing them export-safe.
+        """
+        with self._capture_lock:
+            if status == "connected":
+                self._connects += 1
+                self._last_connect_at = time.time()
+                self._last_rc = 0
+                self._last_reason = "connected"
+            else:
+                if status == "disconnected":
+                    self._disconnects += 1
+                    self._last_disconnect_at = time.time()
+                self._last_rc = rc
+                self._last_reason = message
+
+    def async_check_connection(self) -> None:
+        """Reconnect if the session has dropped (event loop).
+
+        The client's own retry keeps the client id it was created with and
+        this broker rejects a used one, so a drop is permanent without
+        this. ``try_reconnect`` builds a fresh client id, backs off on its
+        own and never gives up for good, which is exactly the behaviour a
+        24 hour capture needs.
+        """
+        if self._stopped or self._client.is_connected():
+            return
+
+        async def _run() -> None:
+            await self.hass.async_add_executor_job(self._reconnect)
+
+        # A tracked task rather than a loose executor job. An executor job
+        # started from a callback belongs to nobody: shutdown does not wait
+        # for it and neither can a test, which is a race rather than a
+        # tolerable one - it passed on the development machine and failed on
+        # CI. A background task would have the same problem, since Home
+        # Assistant deliberately does not wait for those either. One
+        # reconnect attempt is short enough to be worth waiting for.
+        self.hass.async_create_task(
+            _run(), f"ecoflow probe reconnect {self.device_sn[:4]}", eager_start=True
+        )
+
+    def _reconnect(self) -> None:
+        """Run one reconnect attempt (executor thread)."""
+        if self._stopped:
+            return
+        try:
+            # Counted per attempt handed to the client, which may still hold
+            # one back briefly under its own backoff - so this reads as "how
+            # often a connect was driven", slightly above the number of
+            # connects actually tried. The alternative (counting only what
+            # the client let through) would make a link retried all day look
+            # like one never tried, which is the worse lie.
+            with self._capture_lock:
+                self._connect_calls += 1
+            self._client.try_reconnect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "Probe reconnect failed for %s...", self.device_sn[:4], exc_info=True
+            )
+        if self._stopped:
+            # A stop landed while the attempt ran. The flag is set before the
+            # stop's disconnect starts, so reaching this line means whatever
+            # the attempt just built may have been missed by that disconnect
+            # - tear it down again. Disconnecting twice is harmless; leaving
+            # a session up with no owner is not.
+            try:
+                self._client.disconnect()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Probe post-stop disconnect failed for %s...",
+                    self.device_sn[:4],
+                    exc_info=True,
+                )
 
     async def async_start(self) -> bool:
         """Connect and subscribe. Returns False if the connection failed.
@@ -157,6 +333,8 @@ class UnroutedDeviceProbe:
         processed, the subscribe never happens, and not a single frame
         arrives - while the probe still reports success.
         """
+        with self._capture_lock:
+            self._connect_calls += 1
         if not self._client.create_client():
             return False
         if not self._client.connect():
@@ -165,7 +343,13 @@ class UnroutedDeviceProbe:
         return True
 
     async def async_stop(self) -> None:
-        """Disconnect the listen-only session."""
+        """Disconnect the listen-only session.
+
+        The flag goes up before the disconnect starts: any reconnect that
+        checks it afterwards backs off, and one already past the check
+        re-checks after its attempt and tears its own work down again.
+        """
+        self._stopped = True
         try:
             await self.hass.async_add_executor_job(self._client.disconnect)
         except Exception:  # noqa: BLE001
@@ -281,10 +465,40 @@ async def async_start_probes(
             cert_password,
             user_id,
         )
-        if await probe.async_start():
-            probes.append(probe)
-            _LOGGER.debug(
-                "Capturing raw data for unsupported device %s... for diagnostics",
-                sn[:4],
-            )
+        started = await probe.async_start()
+        # Kept either way. A probe dropped here leaves the diagnostics
+        # download saying "no probe running", which reads as a login
+        # problem and hides the actual reason, and nothing would ever
+        # retry - the watchdog only sees the probes on this list.
+        probes.append(probe)
+        _LOGGER.debug(
+            "Capturing raw data for unsupported device %s... for diagnostics "
+            "(initial connect: %s)",
+            sn[:4],
+            "ok" if started else "failed, will retry",
+        )
     return probes
+
+
+def async_start_probe_watchdog(
+    hass: HomeAssistant, probes: list[UnroutedDeviceProbe]
+) -> CALLBACK_TYPE:
+    """Keep the listen-only sessions alive for the length of the capture.
+
+    Returns the unsubscribe callback. A capture runs for up to 24 hours
+    and every WSS session gets dropped in that time; since paho cannot
+    re-establish one on its own here (used client ids are refused), a
+    capture without this holds only whatever arrived before the first
+    drop, and usually nothing at all.
+    """
+
+    @callback
+    def _check(_now: Any) -> None:
+        # Must be a callback: a plain function is run in the executor, where
+        # scheduling the reconnect job has no event loop to attach to.
+        for probe in probes:
+            probe.async_check_connection()
+
+    return async_track_time_interval(
+        hass, _check, timedelta(seconds=PROBE_WATCHDOG_INTERVAL_S)
+    )

@@ -3,13 +3,24 @@
 import itertools
 import logging
 from collections.abc import Iterator
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from ecoflow_energy.const import RAW_FRAME_KEYS_MAX, RAW_FRAME_PER_KEY_MAX
-from ecoflow_energy.device_probe import UnroutedDeviceProbe, async_start_probes
+from ecoflow_energy.const import (
+    PROBE_WATCHDOG_INTERVAL_S,
+    RAW_FRAME_KEYS_MAX,
+    RAW_FRAME_PER_KEY_MAX,
+)
+from ecoflow_energy.device_probe import (
+    UnroutedDeviceProbe,
+    async_start_probe_watchdog,
+    async_start_probes,
+)
 from ecoflow_energy.ecoflow.cloud_mqtt import EcoFlowMQTTClient
 
 SKIPPED_SN = "RE11TEST00000001"
@@ -79,6 +90,36 @@ class TestListenOnly:
         client._on_connect(paho, None, {}, 0)
 
         paho.publish.assert_not_called()
+        assert client.publish("/any/topic", b"payload") is False
+
+    async def test_a_rebuilt_session_still_transmits_nothing(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The no-write promise has to survive the watchdog's reconnect.
+
+        ``force_reconnect`` throws the paho client away and builds a new
+        one. The promise lives on the wrapper (``_listen_only``), not on
+        the paho instance - this pins that, so it cannot quietly move to
+        somewhere a rebuild would reset.
+        """
+        client = EcoFlowMQTTClient(
+            certificate_account="acc",
+            certificate_password="pw",
+            device_sn=SKIPPED_SN,
+            message_handler=lambda topic, payload: None,
+            user_id="user123",
+            wss_mode=True,
+            enhanced_mode=False,
+            listen_only=True,
+        )
+        client.client = MagicMock()
+
+        with patch("ecoflow_energy.ecoflow.cloud_mqtt.mqtt.Client") as paho_cls:
+            fresh = paho_cls.return_value
+            assert client.force_reconnect() is True
+            client._on_connect(fresh, None, {}, 0)
+
+        fresh.publish.assert_not_called()
         assert client.publish("/any/topic", b"payload") is False
 
     async def test_a_normal_connection_still_requests_data(
@@ -388,6 +429,217 @@ class TestConnectSequence:
         assert probe._connect() is False
         probe._client.connect.assert_not_called()
         probe._client.start_loop.assert_not_called()
+
+
+class TestStayingConnected:
+    """A 24 hour capture that stops at the first drop records nothing.
+
+    Paho retries a lost session on its own, but it retries with the client
+    id it was built with, and this broker refuses one it has already seen.
+    Only ``force_reconnect`` - which ``try_reconnect`` calls - builds a new
+    one, and the coordinator that normally drives it does not exist for a
+    device that was skipped.
+    """
+
+    async def test_a_dropped_session_is_rebuilt(self, hass: HomeAssistant) -> None:
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        probe.async_check_connection()
+        await hass.async_block_till_done()
+
+        probe._client.try_reconnect.assert_called_once()
+
+    async def test_a_live_session_is_left_alone(self, hass: HomeAssistant) -> None:
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = True
+
+        probe.async_check_connection()
+        await hass.async_block_till_done()
+
+        probe._client.try_reconnect.assert_not_called()
+
+    async def test_watchdog_checks_every_probe(self, hass: HomeAssistant) -> None:
+        probes = [_probe(hass), _probe(hass)]
+        for probe in probes:
+            probe._client.is_connected.return_value = False
+
+        unsub = async_start_probe_watchdog(hass, probes)
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + timedelta(seconds=PROBE_WATCHDOG_INTERVAL_S + 1)
+        )
+        await hass.async_block_till_done()
+        unsub()
+
+        for probe in probes:
+            probe._client.try_reconnect.assert_called_once()
+
+    async def test_watchdog_stops_when_unsubscribed(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The capture expires on its own - the timer must go with it."""
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        unsub = async_start_probe_watchdog(hass, [probe])
+        unsub()
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + timedelta(seconds=PROBE_WATCHDOG_INTERVAL_S + 1)
+        )
+        await hass.async_block_till_done()
+
+        probe._client.try_reconnect.assert_not_called()
+
+    async def test_a_stopped_probe_is_not_reconnected(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Unload stops the probes before the timer is cancelled.
+
+        Home Assistant runs the entry's on_unload callbacks - the timer's
+        cancel among them - only after async_unload_entry returns, and
+        async_unload_entry awaits in between. A tick landing in one of
+        those awaits finds the session down (it was just disconnected)
+        and, without the guard, rebuilds it into a connection nothing
+        ever tears down.
+        """
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+        await probe.async_stop()
+
+        probe.async_check_connection()
+        await hass.async_block_till_done()
+
+        probe._client.try_reconnect.assert_not_called()
+
+    async def test_a_stop_landing_mid_attempt_still_ends_disconnected(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A reconnect already past the guard re-checks after its attempt.
+
+        The stop's own disconnect can run before the attempt builds its
+        fresh session, in which case the stop misses it. The attempt has
+        to notice the stop afterwards and tear its own work down again.
+        """
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        def stop_lands_mid_attempt() -> bool:
+            probe._stopped = True
+            return True
+
+        probe._client.try_reconnect.side_effect = stop_lands_mid_attempt
+        probe._reconnect()
+
+        probe._client.disconnect.assert_called_once()
+
+
+class TestConnectionReport:
+    """An empty capture has to say why it is empty.
+
+    The reader of a diagnostics download cannot see the machine it came
+    from. "connected: false" on its own fits a refused login, a link that
+    died hours ago, and a silent device equally well - and a listen-only
+    session is demonstrably not silent, a device at rest sends a frame
+    every few seconds.
+    """
+
+    async def test_refused_session_reports_the_reason(
+        self, hass: HomeAssistant
+    ) -> None:
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        probe._on_status("connect_failed", 5, "Auth failed")
+
+        report = probe.connection
+        assert report["ever_connected"] is False
+        assert report["last_rc"] == 5
+        assert "Auth failed" in report["last_rc_reason"]
+        assert "never connected" in report["verdict"]
+
+    async def test_no_reply_at_all_is_distinguishable(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Nothing came back from the broker - not even a refusal."""
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        report = probe.connection
+        assert report["ever_connected"] is False
+        assert "last_rc" not in report
+        assert report["verdict"] == "never connected - no reply from the broker"
+
+    async def test_a_lost_session_reads_as_lost_not_as_never(
+        self, hass: HomeAssistant
+    ) -> None:
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        probe._on_status("connected", 0, "Connected")
+        probe._on_status("disconnected", 7, "Disconnected (rc=7)")
+
+        report = probe.connection
+        assert report["ever_connected"] is True
+        assert report["sessions"] == 1
+        assert report["disconnects"] == 1
+        assert "connected earlier" in report["verdict"]
+        # The client's own wording, not the CONNACK table: disconnect codes
+        # are a different namespace, and captioning a drop with connect-
+        # refusal language ("Bad username/password" for a lost link) would
+        # mislead exactly the reader this report exists for.
+        assert report["last_rc_reason"] == "Disconnected (rc=7)"
+
+    async def test_ages_are_reported_from_the_capture_clock(
+        self, hass: HomeAssistant
+    ) -> None:
+        with patch("ecoflow_energy.device_probe.time.time", return_value=1000.0):
+            probe = _probe(hass)
+            probe._on_status("connected", 0, "Connected")
+        probe._client.is_connected.return_value = True
+
+        with patch("ecoflow_energy.device_probe.time.time", return_value=1300.0):
+            report = probe.connection
+
+        assert report["capture_age_s"] == 300
+        assert report["last_connect_age_s"] == 300
+        assert report["verdict"] == "listening"
+
+    async def test_reconnect_attempts_are_counted(self, hass: HomeAssistant) -> None:
+        """Otherwise a link retried all day looks the same as one never tried."""
+        probe = _probe(hass)
+        probe._client.is_connected.return_value = False
+
+        probe._reconnect()
+        probe._reconnect()
+
+        assert probe.connection["connect_attempts"] == 2
+
+    async def test_a_refused_connect_reaches_the_report(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The real client, not a stand-in for it.
+
+        A refused CONNACK never reaches ``_on_disconnect``, so if the
+        client does not report it the probe has no way to learn the reason
+        and the capture stays mute about its own failure.
+        """
+        seen: list[tuple[str, int, str]] = []
+        client = EcoFlowMQTTClient(
+            certificate_account="acc",
+            certificate_password="pw",
+            device_sn=SKIPPED_SN,
+            message_handler=lambda topic, payload: None,
+            user_id="user123",
+            wss_mode=True,
+            listen_only=True,
+            status_handler=lambda status, rc, msg: seen.append((status, rc, msg)),
+        )
+        paho = MagicMock()
+        client.client = paho
+
+        client._on_connect(paho, None, {}, 5)
+
+        assert seen == [("connect_failed", 5, "Auth failed (credentials expired?)")]
 
 
 class TestStartProbes:

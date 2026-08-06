@@ -47,6 +47,22 @@ _LOGGER = logging.getLogger(__name__)
 # instance - can never succeed and costs the full timeout twice per connect.
 PUBLISH_ACK_TIMEOUT_S = 5.0
 
+# CONNACK return codes in words. These words travel: the status handler
+# passes them to the listen-only capture, which exports them verbatim into a
+# diagnostics download. That is also why every message handed to a
+# status_handler must stay free of serials, account ids and topics - it may
+# end up attached to a public issue. The table applies to CONNACK only;
+# disconnect reason codes are a different namespace and are not named here.
+CONNECT_REASONS = {
+    1: "Protocol version rejected",
+    2: "ClientID rejected",
+    3: "Broker unavailable",
+    4: "Bad username/password",
+    5: "Auth failed (credentials expired?)",
+    134: "Bad username/password",
+    135: "Not authorized (credentials expired?)",
+}
+
 
 class EcoFlowMQTTClient:
     """MQTT client for the EcoFlow cloud broker (WSS + TCP)."""
@@ -317,16 +333,7 @@ class EcoFlowMQTTClient:
             if self.status_handler:
                 self.status_handler("connected", 0, "Connected")
         else:
-            rc_reasons = {
-                1: "Protocol version rejected",
-                2: "ClientID rejected",
-                3: "Broker unavailable",
-                4: "Bad username/password",
-                5: "Auth failed (credentials expired?)",
-                134: "Bad username/password",
-                135: "Not authorized (credentials expired?)",
-            }
-            reason = rc_reasons.get(rc_val, "unknown error")
+            reason = CONNECT_REASONS.get(rc_val, "unknown error")
             auth_failure = rc_val in (4, 5, 134, 135)
             if auth_failure:
                 self._log_issue("warning", "MQTT connect failed: rc=%s (%s) — scheduling credential refresh", rc_val, reason)
@@ -335,6 +342,12 @@ class EcoFlowMQTTClient:
             self.connected = False
             if auth_failure and self._auth_error_handler:
                 self._auth_error_handler()
+
+            # A refused session never reaches _on_disconnect, so without this
+            # the only trace of it is a debug line. The listen-only capture
+            # has to report the reason to someone who cannot see that log.
+            if self.status_handler:
+                self.status_handler("connect_failed", rc_val, reason)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         """Callback on MQTT disconnect.
@@ -533,8 +546,16 @@ class EcoFlowMQTTClient:
             self.client.loop_stop()
 
     def is_connected(self) -> bool:
-        """Check if the client is connected."""
-        return self.connected and self.client is not None and self.client.is_connected()
+        """Check if the client is connected.
+
+        Reads a local reference: ``self.client`` is swapped to ``None`` by
+        ``force_reconnect`` on an executor thread, and re-reading the
+        attribute between the None-check and the call would raise on
+        whatever thread asked - the event loop, when diagnostics or the
+        probe watchdog are the caller.
+        """
+        client = self.client
+        return self.connected and client is not None and client.is_connected()
 
     def publish(
         self, topic: str, payload: str | bytes, qos: int = 1, wait: bool = False,
