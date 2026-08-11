@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -219,6 +220,86 @@ class TestUnloadEntry:
         assert result is True
         # After unload, entry_id should be removed from hass.data[DOMAIN]
         assert standard_config_entry.entry_id not in hass.data.get(DOMAIN, {})
+
+
+class TestShutdownStopsConnections:
+    async def test_home_assistant_stop_shuts_down_coordinators(
+        self,
+        hass: HomeAssistant,
+        standard_config_entry: MockConfigEntry,
+        mock_iot_api,
+        mock_mqtt_client,
+        mock_http_client,
+    ) -> None:
+        """Stopping Home Assistant disconnects MQTT before the loop closes.
+
+        Home Assistant does not unload config entries when it stops, so
+        nothing here used to run: the paho threads kept delivering into a
+        loop that was already gone, and each message that landed in that
+        window put a warning in the user's log. A reload never showed it,
+        because a reload does unload the entry - which is why the burst only
+        ever appeared on a restart.
+        """
+        standard_config_entry.add_to_hass(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.coordinator.EcoFlowDeviceCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ):
+            await hass.config_entries.async_setup(standard_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        coordinators = hass.data[DOMAIN][standard_config_entry.entry_id]
+        assert coordinators, "setup produced no coordinator to shut down"
+
+        with patch(
+            "custom_components.ecoflow_energy.coordinator.EcoFlowDeviceCoordinator.async_shutdown",
+            new_callable=AsyncMock,
+        ) as mock_shutdown:
+            hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+            await hass.async_block_till_done()
+
+        assert mock_shutdown.await_count == len(coordinators)
+
+    async def test_home_assistant_stop_stops_probes(
+        self,
+        hass: HomeAssistant,
+        standard_config_entry: MockConfigEntry,
+        mock_iot_api,
+        mock_mqtt_client,
+        mock_http_client,
+    ) -> None:
+        """Stopping Home Assistant closes listen-only probe sessions too.
+
+        Probes hold their own WSS connections and paho threads, on the same
+        footing as the coordinators: nothing unloads the entry on stop, so
+        without the stop listener their threads would also outlive the loop.
+        The coordinator test above would pass even if the listener ignored
+        the probe list - this one fails then.
+        """
+        standard_config_entry.add_to_hass(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.coordinator.EcoFlowDeviceCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ):
+            await hass.config_entries.async_setup(standard_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        probe = MagicMock()
+        probe.async_stop = AsyncMock()
+        hass.data.setdefault(DATA_DEVICE_PROBES, {})[
+            standard_config_entry.entry_id
+        ] = [probe]
+
+        with patch(
+            "custom_components.ecoflow_energy.coordinator.EcoFlowDeviceCoordinator.async_shutdown",
+            new_callable=AsyncMock,
+        ):
+            hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+            await hass.async_block_till_done()
+
+        probe.async_stop.assert_awaited_once()
 
 
 # ===========================================================================
