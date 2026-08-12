@@ -779,6 +779,8 @@ SMARTPLUG_NUMBERS: list[EcoFlowNumberDef] = [
 ]
 
 STREAM_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef("stream_charge_limit", "Charge Limit", "max_charge_soc_pct", "%", "mdi:battery-charging-100", 3, 100, 1, enhanced_only=True),
+    EcoFlowNumberDef("stream_discharge_limit", "Discharge Limit", "min_discharge_soc_pct", "%", "mdi:battery-arrow-down", 0, 95, 1, enhanced_only=True),
     EcoFlowNumberDef("backup_reserve", "Backup Reserve", "backup_reserve_pct", "%", "mdi:battery-lock", 3, 95, 1, enhanced_only=True),
 ]
 
@@ -1125,12 +1127,28 @@ def excluded_keys_for_serial(device_sn: str) -> frozenset[str]:
 # them - including the two SoC limits an ES21 demonstrably reports.
 STREAM_AC5000_CONTROL_PREFIXES: frozenset[str] = frozenset({"ES22"})
 
+# Serial prefixes whose Stream (BK-series) writes have been confirmed on
+# hardware. Every config write this integration sends to that family was
+# reproduced from a frame captured on a Stream AC Pro and then exercised on
+# one, so a variant that merely reports the same telemetry stays read-only
+# until one of its own frames says otherwise. Same allowlist reasoning as
+# STREAM_AC5000_CONTROL_PREFIXES above: a prefix added later gets no controls
+# until someone decides here.
+STREAM_CONTROL_PREFIXES: frozenset[str] = frozenset({"BK31"})
+
 
 def supports_stream_ac5000_controls(device_sn: str) -> bool:
     """Return whether this STREAM AC 5000 variant may be written to."""
     if not device_sn:
         return False
     return device_sn[:4].upper() in STREAM_AC5000_CONTROL_PREFIXES
+
+
+def supports_stream_controls(device_sn: str) -> bool:
+    """Return whether this Stream variant may be written to."""
+    if not device_sn:
+        return False
+    return device_sn[:4].upper() in STREAM_CONTROL_PREFIXES
 
 
 def filter_defs_for_serial(definitions: list[_DefT], device_sn: str) -> list[_DefT]:

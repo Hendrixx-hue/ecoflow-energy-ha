@@ -1533,6 +1533,12 @@
       "max_charge_soc": {
         "name": "Max. Ladezustand"
       },
+      "stream_charge_limit": {
+        "name": "Ladegrenze"
+      },
+      "stream_discharge_limit": {
+        "name": "Entladegrenze"
+      },
       "backup_reserve": {
         "name": "Backup-Reserve"
       },

@@ -273,15 +273,83 @@ class SetCommandsMixin:
         return ok
 
     # ------------------------------------------------------------------
+    # Stream BK-series SoC config writes (254/17)
+    # ------------------------------------------------------------------
+
+    async def async_set_stream_soc_limits(
+        self, *, charge: int | None = None, discharge: int | None = None,
+    ) -> bool:
+        """Write the grouped Stream charge/discharge limit configuration.
+
+        The app sends charge limit, discharge limit and backup reserve in one
+        frame, so all three travel on every write. The two the caller did not
+        touch are read from live telemetry and sent back unchanged; a default
+        substituted for a missing one would rewrite a setting nobody asked to
+        change, which is why an unreported value refuses the write instead.
+        """
+        from ..ecoflow.energy_stream import build_stream_soc_limits_payload
+
+        async with self._device_config_lock:
+            data = self.data or {}
+            current_charge = as_known_int(data.get("max_charge_soc_pct"))
+            current_discharge = as_known_int(data.get("min_discharge_soc_pct"))
+            backup = as_known_int(data.get("backup_reserve_pct"))
+            if (
+                current_charge is None
+                or current_discharge is None
+                or backup is None
+            ):
+                raise DeviceValueNotReported("Stream SoC limits")
+
+            requested_charge = current_charge if charge is None else charge
+            requested_discharge = (
+                current_discharge if discharge is None else discharge
+            )
+
+            payload = build_stream_soc_limits_payload(
+                requested_charge,
+                requested_discharge,
+                backup,
+                self.device_sn,
+            )
+            if not await self.async_send_proto_set_command(
+                payload, label="stream_soc_limits"
+            ):
+                return False
+            self._seed_device_values(
+                max_charge_soc_pct=requested_charge,
+                min_discharge_soc_pct=requested_discharge,
+                backup_reserve_pct=backup,
+            )
+            return True
+
+    async def async_set_stream_backup_reserve(self, reserve_pct: int) -> bool:
+        """Write Stream backup reserve without racing a grouped limit write."""
+        from ..ecoflow.energy_stream import build_stream_backup_reserve_payload
+
+        async with self._device_config_lock:
+            payload = build_stream_backup_reserve_payload(
+                reserve_pct, self.device_sn
+            )
+            if not await self.async_send_proto_set_command(
+                payload, label="stream_backup_reserve"
+            ):
+                return False
+            self._seed_device_values(backup_reserve_pct=reserve_pct)
+            return True
+
+    # ------------------------------------------------------------------
     # STREAM AC 5000 config writes (254/38)
     #
     # Each one reads what the device currently reports before it can send,
     # so the read and the send are one operation under
-    # `_stream_ac5000_config_lock`. A caller that read first and sent after
+    # `_device_config_lock`. A caller that read first and sent after
     # would interleave with the other entity writing the same config field.
     # The values sent are seeded into the store before the lock is released,
     # for the same reason: a waiter deciding what to send must not see the
-    # state from before the write it is queued behind.
+    # state from before the write it is queued behind. The Stream writes
+    # above share both the lock and `_seed_device_values` for exactly these
+    # two reasons.
     # ------------------------------------------------------------------
 
     async def async_set_stream_ac5000_soc_limits(
@@ -294,7 +362,7 @@ class SetCommandsMixin:
         """
         from ..ecoflow.stream_ac5000_commands import build_soc_limits_payload
 
-        async with self._stream_ac5000_config_lock:
+        async with self._device_config_lock:
             data = self.data or {}
             if charge is None:
                 charge = as_known_int(data.get("max_charge_soc_pct"))
@@ -308,7 +376,7 @@ class SetCommandsMixin:
                 payload, label="stream_ac5000_soc_limits"
             ):
                 return False
-            self._seed_stream_ac5000(
+            self._seed_device_values(
                 max_charge_soc_pct=charge, min_discharge_soc_pct=discharge
             )
             return True
@@ -323,7 +391,7 @@ class SetCommandsMixin:
         """
         from ..ecoflow.stream_ac5000_commands import build_backup_reserve_payload
 
-        async with self._stream_ac5000_config_lock:
+        async with self._device_config_lock:
             data = self.data or {}
             if enabled is None:
                 enabled = data.get("backup_reserve_enabled")
@@ -338,7 +406,7 @@ class SetCommandsMixin:
                 payload, label="stream_ac5000_backup_reserve"
             ):
                 return False
-            self._seed_stream_ac5000(
+            self._seed_device_values(
                 backup_reserve_enabled=enabled, backup_reserve_pct=reserve_pct
             )
             return True
@@ -360,7 +428,7 @@ class SetCommandsMixin:
         )
 
         other = "discharge" if kind == "charge" else "charge"
-        async with self._stream_ac5000_config_lock:
+        async with self._device_config_lock:
             data = self.data or {}
             if as_known_int(data.get(f"scheduled_{other}_power_w")) is not None:
                 if not await self.async_send_proto_set_command(
@@ -379,10 +447,10 @@ class SetCommandsMixin:
                 payload, label=f"stream_ac5000_{kind}_power"
             ):
                 return False
-            self._seed_stream_ac5000(**{f"scheduled_{kind}_power_w": power_w})
+            self._seed_device_values(**{f"scheduled_{kind}_power_w": power_w})
             return True
 
-    def _seed_stream_ac5000(self, **values: Any) -> None:
+    def _seed_device_values(self, **values: Any) -> None:
         """Record values just sent, in both the store and the snapshot."""
         for key, value in values.items():
             self.set_device_value(key, value)
@@ -592,4 +660,3 @@ class SetCommandsMixin:
             )
             self._log_event("set_cmd_fail", f"keys={list(command.keys())[:3]}")
         return ok
-
